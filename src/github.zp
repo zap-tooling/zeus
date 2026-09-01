@@ -1,0 +1,288 @@
+import "std/fs";
+import "std/path";
+import "std/process";
+import "std/string" {eq};
+import "std/json";
+import "@zap-requests/requests";
+import "./utils.zp";
+
+@error
+pub struct GithubError { message: String }
+
+fun mkErr(message: String) GithubError {
+    return GithubError { message: message };
+}
+
+pub struct GithubRepo { owner: String, repo: String }
+
+pub struct Resolved { commit: String, tag: String }
+
+fun startsWithLiteral(s: String, prefix: String) Bool {
+    var pLen: Int = string.len(prefix);
+    if string.len(s) < pLen { return false; }
+    var i: Int = 0;
+    while i < pLen {
+        if string.at(s, i) != string.at(prefix, i) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fun substring(s: String, start: Int, end: Int) String {
+    var result: String = "";
+    var i: Int = start;
+    while i < end {
+        result = string.pushChar(result, string.at(s, i));
+        i = i + 1;
+    }
+    return result;
+}
+
+
+fun trimTrailingSlashesAndDotGit(value: String) String {
+    var end: Int = string.len(value);
+    while end > 0 && string.at(value, end - 1) == '/' {
+        end = end - 1;
+    }
+    if end > 4 && string.at(value, end - 4) == '.' && string.at(value, end - 3) == 'g' && string.at(value, end - 2) == 'i' && string.at(value, end - 1) == 't' {
+        end = end - 4;
+    }
+    return substring(value, 0, end);
+}
+
+pub fun parseGithubUrl(url: String) GithubRepo!GithubError {
+    var prefixLen: Int = 0;
+    if startsWithLiteral(url, "https://github.com/") { prefixLen = 19; }
+    else if startsWithLiteral(url, "http://github.com/") { prefixLen = 18; }
+    else if startsWithLiteral(url, "git@github.com:") { prefixLen = 15; }
+    else {
+        fail mkErr("not a github.com URL: " + url);
+    }
+
+    var rest: String = trimTrailingSlashesAndDotGit(substring(url, prefixLen, string.len(url)));
+
+    var slashIdx: Int = -1;
+    var i: Int = 0;
+    while i < string.len(rest) {
+        if string.at(rest, i) == '/' { slashIdx = i; break; }
+        i = i + 1;
+    }
+    if slashIdx <= 0 {
+        fail mkErr("could not find owner/repo in URL: " + url);
+    }
+    var owner: String = substring(rest, 0, slashIdx);
+
+    var repoEnd: Int = string.len(rest);
+    var j: Int = slashIdx + 1;
+    while j < string.len(rest) {
+        if string.at(rest, j) == '/' { repoEnd = j; break; }
+        j = j + 1;
+    }
+    var repo: String = substring(rest, slashIdx + 1, repoEnd);
+
+    if string.len(owner) == 0 || string.len(repo) == 0 {
+        fail mkErr("could not find owner/repo in URL: " + url);
+    }
+    return GithubRepo { owner: owner, repo: repo };
+}
+
+//auth
+fun shellCapture(cmd: String) String {
+    var tmpFile: String = ".thor_tmp_gh_auth";
+    if process.exec("(" + cmd + ") > " + tmpFile + " 2>/dev/null") != 0 {
+        process.exec("rm -f " + tmpFile);
+        return "";
+    }
+    var out: String = fs.readFile(tmpFile) or err { "" };
+    process.exec("rm -f " + tmpFile);
+    var len: Int = string.len(out);
+    if len > 0 && string.at(out, len - 1) == '\n' {
+        return substring(out, 0, len - 1);
+    }
+    return out;
+}
+
+fun githubToken() String {
+    var fromEnv: String = process.getEnv("GITHUB_TOKEN");
+    if string.len(fromEnv) != 0 { return fromEnv; }
+    fromEnv = process.getEnv("GH_TOKEN");
+    if string.len(fromEnv) != 0 { return fromEnv; }
+    return shellCapture("gh auth token");
+}
+
+fun withAuth(req: requests.Request) requests.Request {
+    var token: String = githubToken();
+    if string.len(token) == 0 { return req; }
+    return req.header("Authorization", "Bearer " + token);
+}
+
+
+fun rawGithubApiGet(url: String) json.Value!requests.Error {
+    var req: requests.Request = requests.Request.get(url)
+        .header("User-Agent", "zeus-thor-package-manager")
+        .header("Accept", "application/vnd.github+json");
+    var resp: requests.Response = withAuth(req).send()?;
+    if !resp.ok() {
+        fail requests.Error { kind: requests.ErrorKind.InvalidResponse, message: "status " + toString(resp.status()) + " for " + url };
+    }
+    return resp.json()?;
+}
+
+fun rawDownloadTarball(url: String) String!requests.Error {
+    var req: requests.Request = requests.Request.get(url)
+        .header("User-Agent", "zeus-thor-package-manager");
+    var resp: requests.Response = withAuth(req).send()?;
+    if !resp.ok() {
+        fail requests.Error { kind: requests.ErrorKind.InvalidResponse, message: "status " + toString(resp.status()) + " for " + url };
+    }
+    return resp.text();
+}
+
+fun extractString(value: json.Value, key: String) String!json.Error {
+    var obj: json.Object = value.asObject()?;
+    return obj.getString(key)?;
+}
+
+fun tagNameIfMatches(item: json.Value, commit: String) String!json.Error {
+    var obj: json.Object = item.asObject()?;
+    var name: String = obj.getString("name")?;
+    var commitObj: json.Object = obj.getObject("commit")?;
+    var sha: String = commitObj.getString("sha")?;
+    if eq(sha, commit) { return name; }
+    return "";
+}
+
+fun findTagForCommit(value: json.Value, commit: String) String!json.Error {
+    var arr: json.Array = value.asArray()?;
+    var i: Int = 0;
+    while i < arr.size() {
+        var item: json.Value = arr.at(i)?;
+        var name: String = tagNameIfMatches(item, commit)?;
+        if string.len(name) != 0 { return name; }
+        i = i + 1;
+    }
+    return "";
+}
+
+
+fun githubApiGet(url: String) json.Value!GithubError {
+    var failed: Bool = false;
+    var failMessage: String = "";
+    var result: json.Value = rawGithubApiGet(url) or err {
+        failed = true;
+        failMessage = err.message;
+        json.Value.nullValue()
+    };
+    if failed {
+        fail mkErr("github api request to " + url + " failed: " + failMessage);
+    }
+    return result;
+}
+
+fun githubApiGetString(url: String, key: String) String!GithubError {
+    var value: json.Value = githubApiGet(url)?;
+    var failed: Bool = false;
+    var failMessage: String = "";
+    var result: String = extractString(value, key) or err {
+        failed = true;
+        failMessage = err.message;
+        ""
+    };
+    if failed {
+        fail mkErr("github api response from " + url + " is missing \"" + key + "\": " + failMessage);
+    }
+    return result;
+}
+
+fun resolveDefaultBranch(owner: String, repo: String) String!GithubError {
+    return githubApiGetString("https://api.github.com/repos/" + owner + "/" + repo, "default_branch")?;
+}
+
+fun resolveCommit(owner: String, repo: String, refName: String) String!GithubError {
+    return githubApiGetString("https://api.github.com/repos/" + owner + "/" + repo + "/commits/" + refName, "sha")?;
+}
+
+// mirrors the old `git describe --tags` behavior.
+fun resolveNearestTag(owner: String, repo: String, commit: String) String {
+    var url: String = "https://api.github.com/repos/" + owner + "/" + repo + "/tags";
+    var failed: Bool = false;
+    var value: json.Value = rawGithubApiGet(url) or err {
+        failed = true;
+        json.Value.nullValue()
+    };
+    if failed { return ""; }
+
+    var name: String = findTagForCommit(value, commit) or err { "" };
+    return name;
+}
+
+pub fun resolve(owner: String, repo: String, refName: String) Resolved!GithubError {
+    var effectiveRef: String = refName;
+    if string.len(effectiveRef) == 0 {
+        effectiveRef = resolveDefaultBranch(owner, repo)?;
+    }
+    var commit: String = resolveCommit(owner, repo, effectiveRef)?;
+    var tag: String = resolveNearestTag(owner, repo, commit);
+    if string.len(tag) == 0 { tag = commit; }
+    return Resolved { commit: commit, tag: tag };
+}
+
+fun downloadTarball(owner: String, repo: String, commit: String) String!GithubError {
+    var url: String = "https://codeload.github.com/" + owner + "/" + repo + "/tar.gz/" + commit;
+    var failed: Bool = false;
+    var failMessage: String = "";
+    var bytes: String = rawDownloadTarball(url) or err {
+        failed = true;
+        failMessage = err.message;
+        ""
+    };
+    if failed {
+        fail mkErr("failed to download " + url + ": " + failMessage);
+    }
+    return bytes;
+}
+
+fun cacheRoot() String {
+    var home: String = process.getEnv("HOME");
+    return path.join(path.join(path.join(home, ".cache"), "thor"), "packages");
+}
+
+pub fun cacheDir(owner: String, repo: String, commit: String) String {
+    return path.join(path.join(path.join(path.join(cacheRoot(), "github.com"), owner), repo), commit);
+}
+
+pub fun hasSubmodules(dir: String) Bool {
+    return fs.exists(path.join(dir, ".gitmodules"));
+}
+
+pub fun fetchInto(owner: String, repo: String, commit: String, destDir: String) Bool!GithubError {
+    var cache: String = cacheDir(owner, repo, commit);
+    if !fs.exists(cache) || !fs.isDir(cache) {
+        var bytes: String = downloadTarball(owner, repo, commit)?;
+        fs.mkdirAll(cache) or err {
+            fail mkErr("failed to create cache dir " + cache);
+        };
+        var tmpTar: String = cache + ".tar.gz";
+        fs.writeFile(tmpTar, bytes) or err {
+            fail mkErr("failed to write downloaded tarball to " + tmpTar);
+        };
+        if process.exec("tar -xzf " + utils.shellQuote(tmpTar) + " -C " + utils.shellQuote(cache) + " --strip-components=1") != 0 {
+            fail mkErr("failed to extract tarball for " + owner + "/" + repo + "@" + commit);
+        }
+        process.exec("rm -f " + utils.shellQuote(tmpTar));
+    }
+
+    if fs.exists(destDir) {
+        process.exec("rm -rf " + utils.shellQuote(destDir));
+    }
+    var destParent: String = path.parent(destDir);
+    if string.len(destParent) != 0 && !eq(destParent, ".") {
+        fs.mkdirAll(destParent) or err {
+            fail mkErr("failed to create parent directory for " + destDir);
+        };
+    }
+    if process.exec("cp -r " + utils.shellQuote(cache) + " " + utils.shellQuote(destDir)) != 0 {
+        fail mkErr("failed to copy cached package into " + destDir);
+    }
+    return true;
+}

@@ -6,6 +6,7 @@ import "std/string" {eq};
 import "./config.zp";
 import "./utils.zp";
 import "std/collection";
+import "./github.zp";
 
 fun extractNameFromUrl(url: String) String {
     var i: Int = string.len(url) - 1;
@@ -134,7 +135,16 @@ fun insertDepsAndImports(content: String, name: String, gitUrl: String, tag: Str
     return res;
 }
 
+fun cloneWithGit(gitUrl: String, vendorPath: String) Int {
+    return process.exec("git clone --recursive " + utils.shellQuote(gitUrl) + " " + utils.shellQuote(vendorPath));
+}
+
 pub fun addDependency(gitUrl: String) Int {
+    return addDependencyWithRef(gitUrl, "");
+}
+
+
+pub fun addDependencyWithRef(gitUrl: String, refArg: String) Int {
     var name: String = extractNameFromUrl(gitUrl);
     if string.len(name) == 0 {
         io.eprintln("Invalid git URL");
@@ -146,23 +156,72 @@ pub fun addDependency(gitUrl: String) Int {
         return 1;
     };
     var vendorPath: String = path.join("vendor", name);
-    
-    if fs.exists(vendorPath) {
-        io.println("Dependency " + name + " already exists in vendor/");
-    } else {
-        io.println("Cloning " + gitUrl + " into " + vendorPath + "...");
-        if process.exec("git clone --recursive " + utils.shellQuote(gitUrl) + " " + utils.shellQuote(vendorPath)) != 0 {
-            io.eprintln("Failed to clone dependency");
+
+    var isGithub: Bool = true;
+    var repo: github.GithubRepo = github.parseGithubUrl(gitUrl) or err {
+        isGithub = false;
+        github.GithubRepo { owner: "", repo: "" }
+    };
+
+    var commit: String = "";
+    var tag: String = "";
+
+    if isGithub {
+        var resolveFailed: Bool = false;
+        var resolveFailMessage: String = "";
+        var resolved: github.Resolved = github.resolve(repo.owner, repo.repo, refArg) or err {
+            resolveFailed = true;
+            resolveFailMessage = err.message;
+            github.Resolved { commit: "", tag: "" }
+        };
+        if resolveFailed {
+            io.eprintln("Failed to resolve " + gitUrl + ": " + resolveFailMessage);
             return 1;
         }
-    }
+        commit = resolved.commit;
+        tag = resolved.tag;
 
-    var cwd: String = runShellCapture("pwd");
-    var commit: String = runShellCapture("cd " + utils.shellQuote(vendorPath) + " && git rev-parse HEAD");
-    var tag: String = runShellCapture("cd " + utils.shellQuote(vendorPath) + " && git describe --tags --abbrev=0 2>/dev/null");
-    
-    if string.len(tag) == 0 {
-        tag = commit;
+        if fs.exists(vendorPath) {
+            io.println("Dependency " + name + " already exists in vendor/");
+        } else {
+            io.println("Fetching " + gitUrl + "@" + commit + "...");
+            var fetchFailed: Bool = false;
+            var fetchFailMessage: String = "";
+            var fetchedOk: Bool = github.fetchInto(repo.owner, repo.repo, commit, vendorPath) or err {
+                fetchFailed = true;
+                fetchFailMessage = err.message;
+                false
+            };
+            if fetchFailed {
+                io.eprintln("Failed to fetch " + gitUrl + ": " + fetchFailMessage);
+                return 1;
+            }
+
+            if github.hasSubmodules(vendorPath) {
+                io.println(name + " has git submodules; falling back to git clone --recursive");
+                process.exec("rm -rf " + utils.shellQuote(vendorPath));
+                if cloneWithGit(gitUrl, vendorPath) != 0 {
+                    io.eprintln("Failed to clone dependency");
+                    return 1;
+                }
+                commit = runShellCapture("cd " + utils.shellQuote(vendorPath) + " && git rev-parse HEAD");
+                tag = runShellCapture("cd " + utils.shellQuote(vendorPath) + " && git describe --tags --abbrev=0 2>/dev/null");
+                if string.len(tag) == 0 { tag = commit; }
+            }
+        }
+    } else {
+        if fs.exists(vendorPath) {
+            io.println("Dependency " + name + " already exists in vendor/");
+        } else {
+            io.println("Cloning " + gitUrl + " into " + vendorPath + "...");
+            if cloneWithGit(gitUrl, vendorPath) != 0 {
+                io.eprintln("Failed to clone dependency");
+                return 1;
+            }
+        }
+        commit = runShellCapture("cd " + utils.shellQuote(vendorPath) + " && git rev-parse HEAD");
+        tag = runShellCapture("cd " + utils.shellQuote(vendorPath) + " && git describe --tags --abbrev=0 2>/dev/null");
+        if string.len(tag) == 0 { tag = commit; }
     }
 
     var libPath: String = "./vendor/" + name + "/src/lib";
@@ -201,14 +260,45 @@ pub fun restoreAndBuildDependencies(cfg: config.ProjectConfig) Int {
         
         if !fs.exists(vendorPath) {
             io.println("Restoring dependency " + dep.name + "...");
-            if process.exec("git clone --recursive " + utils.shellQuote(dep.url) + " " + utils.shellQuote(vendorPath)) != 0 {
-                io.eprintln("Failed to clone " + dep.name);
-                return 1;
+
+            var isGithub: Bool = true;
+            var repo: github.GithubRepo = github.parseGithubUrl(dep.url) or err {
+                isGithub = false;
+                github.GithubRepo { owner: "", repo: "" }
+            };
+
+            var restored: Bool = false;
+            if isGithub && string.len(dep.commit) != 0 {
+                var fetchFailed: Bool = false;
+                var fetchFailMessage: String = "";
+                var fetchedOk: Bool = github.fetchInto(repo.owner, repo.repo, dep.commit, vendorPath) or err {
+                    fetchFailed = true;
+                    fetchFailMessage = err.message;
+                    false
+                };
+                if fetchFailed {
+                    io.eprintln("Failed to restore " + dep.name + " via github: " + fetchFailMessage);
+                    return 1;
+                }
+                restored = true;
+
+                if github.hasSubmodules(vendorPath) {
+                    io.println(dep.name + " has git submodules; falling back to git clone --recursive");
+                    process.exec("rm -rf " + utils.shellQuote(vendorPath));
+                    restored = false;
+                }
             }
-            if string.len(dep.commit) != 0 {
-                process.exec("cd " + utils.shellQuote(vendorPath) + " && git checkout " + utils.shellQuote(dep.commit));
+
+            if !restored {
+                if process.exec("git clone --recursive " + utils.shellQuote(dep.url) + " " + utils.shellQuote(vendorPath)) != 0 {
+                    io.eprintln("Failed to clone " + dep.name);
+                    return 1;
+                }
+                if string.len(dep.commit) != 0 {
+                    process.exec("cd " + utils.shellQuote(vendorPath) + " && git checkout " + utils.shellQuote(dep.commit));
+                }
+                process.exec("cd " + utils.shellQuote(vendorPath) + " && git submodule update --init --recursive");
             }
-            process.exec("cd " + utils.shellQuote(vendorPath) + " && git submodule update --init --recursive");
         }
         
         var buildScript: String = path.join(vendorPath, "build.sh");
